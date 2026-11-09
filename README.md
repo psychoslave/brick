@@ -1,4 +1,4 @@
-# brick-poc
+# brick
 
 ## The BRICK Architectural Stack
 
@@ -8,7 +8,69 @@
 | **C** | Common Gateway Interface (CGI), specifically Fast Common Gateway Interface (FastCGI) record protocol |
 | **K** | Kernel queue (kqueue) for native event notifications and non-blocking socket multiplexing |
 
-`brick-poc` is a zero-dependency, ultra-minimalist web service proof of concept that demonstrates a complete vertical stack from kernel event handling to HTTP response generation, entirely within a single native process.
+`brick` is a zero-dependency, ultra-minimalist library for building FastCGI services with non-blocking I/O on BSD/Darwin systems. It provides a clean separation between the generic engine and domain-specific logic, enabling reuse across multiple projects.
+
+## Architecture
+
+```mermaid
+graph TD
+    A[kqueue Event Loop] -->|read events| B[FastCGI Parser]
+    B -->|parsed requests| C[SQLite Database]
+    C -->|query results| B
+    B -->|responses| D[Unix Domain Socket]
+    D -->|/tmp/brick.sock| E[Client]
+    
+    style A fill:#f9f,stroke:#333
+    style B fill:#bbf,stroke:#333
+    style C fill:#9f9,stroke:#333
+    style D fill:#ff9,stroke:#333
+```
+
+## Separation of Concerns
+
+This project is structured as a **library crate** (`brick`) with a **reference binary** (`brick_server`).
+
+### Library (`src/lib.rs`)
+The core engine provides:
+
+- **Kernel queue event loop**: Non-blocking I/O multiplexing using `kqueue()`
+- **Unix domain socket management**: Connection handling with proper lifecycle
+- **FastCGI protocol parsing**: Record framing and request/response abstraction
+- **Extensible handler trait**: `RequestHandler` for custom business logic
+
+### Reference Server (`src/bin/brick_server.rs`)
+A minimal implementation demonstrating how to use the library:
+
+- Listens on `/tmp/brick.sock`
+- Implements a simple `PingHandler` that responds with "pong"
+- Provides a fallback HTTP responder for testing
+
+### Downstream Projects
+To use `brick` in another project:
+
+```toml
+[dependencies]
+brick = { path = "../brick" }
+```
+
+Then implement the `RequestHandler` trait:
+
+```rust
+use brick::{FcgiRequest, FcgiResponse, RequestHandler};
+use rusqlite::Connection;
+
+struct MyHandler;
+
+impl RequestHandler for MyHandler {
+    fn handle(&self, request: &FcgiRequest, db: &Connection) -> FcgiResponse {
+        FcgiResponse {
+            request_id: request.request_id,
+            status: 0,
+            body: b"Hello, World!\n".to_vec(),
+        }
+    }
+}
+```
 
 ## Core Mechanics
 
@@ -22,11 +84,11 @@ The service uses BSD/Darwin's native `kqueue()` system call to register interest
 
 ### FastCGI Protocol Parsing
 
-FastCGI provides a binary protocol for efficient request/response exchange between web servers and applications. This POC:
+FastCGI provides a binary protocol for efficient request/response exchange between web servers and applications:
 
-- Parses FastCGI record headers and body content
-- Handles request multiplexing over a single connection
-- Maintains request state for proper response routing
+- **Record aggregation**: Properly handles multi-frame requests (BEGIN_REQUEST, PARAMS, STDIN)
+- **Environment parsing**: Decodes FastCGI name-value pairs into structured request objects
+- **Connection lifecycle**: Respects FCGI_KEEP_CONN flag for connection reuse
 
 ### Embedded SQLite
 
@@ -38,7 +100,7 @@ SQLite provides zero-configuration, serverless database functionality:
 
 ### Unix Domain Socket
 
-Communication occurs over a Unix domain socket at `/tmp/brick_poc.sock`:
+Communication occurs over a Unix domain socket at `/tmp/brick.sock`:
 
 - **Local-only**: No network exposure, accessible only to local processes
 - **Filesystem permissions**: Standard Unix permission model for access control
@@ -55,74 +117,78 @@ Communication occurs over a Unix domain socket at `/tmp/brick_poc.sock`:
 
 ```bash
 # Clone the repository
-git clone git@github.com:psychoslave/brick-poc.git
-cd brick-poc
+git clone git@github.com:psychoslave/brick.git
+cd brick
 
-# Build the project
-cargo build --release
+# Build the library and reference server
+cargo build
 ```
 
 ## Execution
 
-### Starting the Service
+### Starting the Reference Server
 
 ```bash
-cargo run --release
+cargo run --bin brick_server
 ```
 
-The service will create a Unix domain socket at `/tmp/brick_poc.sock` and begin listening for connections.
+The server will create a Unix domain socket at `/tmp/brick.sock` and begin listening for connections.
 
-### Verification
-
-Use `nc` (netcat) or `socat` to test the service:
+### Testing with netcat
 
 ```bash
-# Using netcat (if it supports Unix sockets)
-nc -U /tmp/brick_poc.sock
+# Send raw HTTP request (fallback mode)
+echo "GET / HTTP/1.1" | nc -U /tmp/brick.sock
 
-# Using socat
-socat - UNIX-CONNECT:/tmp/brick_poc.sock
-
-# Send a test request
-curl --unix-socket /tmp/brick_poc.sock http://localhost/
+# Expected response:
+# HTTP/1.1 200 OK
+# Content-Type: text/plain
+# Content-Length: 5
+# Connection: close
+#
+# pong
 ```
 
-### Expected Response
+### Using as a Library
 
-```
-HTTP/1.1 200 OK
-Content-Type: text/plain; charset=utf-8
-Connection: close
+Add `brick` as a dependency to your project and implement the `RequestHandler` trait:
 
-Proof of concept: native kernel queue listener executed successfully.
-```
+```rust
+use brick::{FcgiRequest, FcgiResponse, RequestHandler};
+use rusqlite::Connection;
 
-## Architecture Overview
+struct MyHandler;
 
-```mermaid
-graph TD
-    A[kqueue Event Loop] -->|read events| B[FastCGI Parser]
-    B -->|parsed requests| C[SQLite Database]
-    C -->|query results| B
-    B -->|responses| D[Unix Domain Socket]
-    D -->|/tmp/brick_poc.sock| E[Client]
-    
-    style A fill:#f9f,stroke:#333
-    style B fill:#bbf,stroke:#333
-    style C fill:#9f9,stroke:#333
-    style D fill:#ff9,stroke:#333
+impl RequestHandler for MyHandler {
+    fn handle(&self, request: &FcgiRequest, db: &Connection) -> FcgiResponse {
+        // Your business logic here
+        FcgiResponse {
+            request_id: request.request_id,
+            status: 0,
+            body: b"Hello!\n".to_vec(),
+        }
+    }
+}
+
+// Then in your main function, use the kqueue event loop
+// to process incoming connections and dispatch to your handler
 ```
 
 ## Project Structure
 
 ```
-brick-poc/
-├── Cargo.toml          # Rust package manifest
-├── Cargo.lock          # Dependency lock file
-├── README.md           # This file
-├── .gitignore          # Git ignore patterns
-└── src/
-    └── main.rs         # Main application entry point
+brick/
+├── Cargo.toml              # Package manifest
+├── Cargo.lock              # Dependency lock file
+├── CHANGELOG.md            # Release history
+├── README.md               # This file
+├── AGENTS.md               # AI assistance guidelines
+├── .gitignore              # Git ignore patterns
+├── src/
+│   ├── lib.rs              # Generic BRICK engine library
+│   ├── main.rs             # Library documentation entry
+│   └── bin/
+│       └── brick_server.rs # Reference server implementation
 ```
 
 ## License
@@ -131,16 +197,16 @@ This project is provided as-is for proof-of-concept purposes. See the repository
 
 ## Technical Notes
 
-- The service currently handles a single request at a time in the event loop
-- FastCGI protocol support is minimal and focused on request/response basics
-- SQLite integration is planned for future iterations
-- Error handling is basic but covers critical paths
+- The library handles FastCGI frame parsing with proper state machine
+- Non-blocking I/O is implemented using kqueue for both read and write events
+- Connection lifecycle is properly managed (EOF detection, cleanup)
+- File descriptors are safely managed (no double-close)
 
 ## Future Enhancements
 
-- [ ] Full FastCGI protocol implementation
-- [ ] SQLite database integration for request logging
-- [ ] Concurrent request handling
-- [ ] HTTPS support via Unix domain socket forwarding
+- [ ] Add EVFILT_WRITE support for non-blocking writes
+- [ ] Implement connection pooling
+- [ ] Add TLS support via Unix domain socket forwarding
 - [ ] Configuration file support
 - [ ] Graceful shutdown handling
+- [ ] Metrics and monitoring hooks
