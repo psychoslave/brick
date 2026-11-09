@@ -99,24 +99,18 @@ Proof of concept: native kernel queue listener executed successfully.
 
 ## Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         brick-poc                               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
-│  │  kqueue()   │    │ FastCGI     │    │    SQLite           │  │
-│  │  Event Loop │────▶│ Protocol    │────▶│ Embedded Database   │  │
-│  │             │    │ Parser      │    │                     │  │
-│  └─────────────┘    └─────────────┘    └─────────────────────┘  │
-│           │                    │                     │            │
-│           ▼                    ▼                     ▼            │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │                    Unix Domain Socket                    │    │
-│  │                    /tmp/brick_poc.sock                    │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    A[kqueue Event Loop] -->|read events| B[FastCGI Parser]
+    B -->|parsed requests| C[SQLite Database]
+    C -->|query results| B
+    B -->|responses| D[Unix Domain Socket]
+    D -->|/tmp/brick_poc.sock| E[Client]
+    
+    style A fill:#f9f,stroke:#333
+    style B fill:#bbf,stroke:#333
+    style C fill:#9f9,stroke:#333
+    style D fill:#ff9,stroke:#333
 ```
 
 ## Project Structure
