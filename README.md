@@ -2,11 +2,11 @@
 
 ## The BRICK Architectural Stack
 
-**B**erkeley Software Distribution (BSD) or **D**arwin as the host operating system.
-**R**ust for compiled, memory-safe backend logic.
-**I**n-process database (SQLite) for direct embedded persistence without network overhead.
-**C**ommon Gateway Interface (CGI), specifically Fast Common Gateway Interface (FastCGI) record protocol.
-**K**ernel queue (kqueue) for native event notifications and non-blocking socket multiplexing.
+| **B** | Berkeley Software Distribution (BSD) or Darwin as the host operating system |
+| **R** | Rust for compiled, memory-safe backend logic |
+| **I** | In-process database (SQLite) for direct embedded persistence without network overhead |
+| **C** | Common Gateway Interface (CGI), specifically Fast Common Gateway Interface (FastCGI) record protocol |
+| **K** | Kernel queue (kqueue) for native event notifications and non-blocking socket multiplexing |
 
 `brick-poc` is a zero-dependency, ultra-minimalist web service proof of concept that demonstrates a complete vertical stack from kernel event handling to HTTP response generation, entirely within a single native process.
 
