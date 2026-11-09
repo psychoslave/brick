@@ -9,10 +9,40 @@
 //!
 //! This crate provides a reusable library for building FastCGI services with
 //! non-blocking I/O using kernel queue on BSD/Darwin systems.
+//!
+//! ## Usage
+//!
+//! ```no_run
+//! use brick::{Server, RequestHandler, FcgiRequest, FcgiResponse, ConnectionState};
+//! use rusqlite::Connection;
+//!
+//! struct MyHandler;
+//!
+//! impl RequestHandler for MyHandler {
+//!     fn handle(&self, request: &FcgiRequest, db: &Connection) -> FcgiResponse {
+//!         FcgiResponse {
+//!             request_id: request.request_id,
+//!             status: 0,
+//!             body: b"Hello, World!\n".to_vec(),
+//!         }
+//!     }
+//! }
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let db = Connection::open_in_memory()?;
+//!     let server = Server::bind("/tmp/myapp.sock")?;
+//!     server.serve(&db, MyHandler)?;
+//!     Ok(())
+//! }
+//! ```
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::{AsRawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::Arc;
 use rusqlite::Connection;
 
 /// FastCGI record type constants
@@ -27,6 +57,227 @@ pub const FCGI_RESPONDER: u16 = 1;
 
 /// Maximum buffer size for connection reads
 const MAX_BUFFER_SIZE: usize = 4096;
+
+/// Event capacity for kqueue
+const EVENT_CAPACITY: usize = 64;
+
+/// The Server struct encapsulates the FastCGI server engine.
+///
+/// It manages the Unix domain socket listener, kqueue event loop,
+/// and connection lifecycle. Use `Server::bind()` to create a new server
+/// and `Server::serve()` to start accepting and processing requests.
+pub struct Server {
+    /// The socket path for the Unix domain socket
+    socket_path: String,
+    /// The listener for incoming connections
+    listener: UnixListener,
+    /// The kqueue file descriptor
+    kq: i32,
+    /// The listener file descriptor
+    listener_fd: i32,
+    /// Whether the server has been initialized
+    initialized: bool,
+}
+
+impl Server {
+    /// Create a new server bound to the specified socket path.
+    ///
+    /// This initializes the Unix domain socket and kqueue.
+    ///
+    /// # Arguments
+    /// * `socket_path` - Path to the Unix domain socket
+    ///
+    /// # Returns
+    /// A new Server instance ready to accept connections
+    pub fn bind(socket_path: &str) -> std::io::Result<Self> {
+        // Clean up any existing socket
+        if fs::metadata(socket_path).is_ok() {
+            fs::remove_file(socket_path)?;
+        }
+
+        // Create and configure Unix domain socket
+        let listener = UnixListener::bind(socket_path)?;
+        listener.set_nonblocking(true)?;
+        fs::set_permissions(socket_path, fs::Permissions::from_mode(0o777))?;
+        let listener_fd = listener.as_raw_fd();
+
+        // Initialize kqueue
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // Register listener with kqueue
+        register_kevent(kq, listener_fd, libc::EVFILT_READ, libc::EV_ADD | libc::EV_ENABLE)?;
+
+        Ok(Server {
+            socket_path: socket_path.to_string(),
+            listener,
+            kq,
+            listener_fd,
+            initialized: true,
+        })
+    }
+
+    /// Start the server event loop and process incoming requests.
+    ///
+    /// This method blocks indefinitely, processing FastCGI requests
+    /// and dispatching them to the provided handler.
+    ///
+    /// # Arguments
+    /// * `db` - SQLite database connection to pass to request handlers
+    /// * `handler` - Request handler implementing the RequestHandler trait
+    ///
+    /// # Returns
+    /// Ok(()) on graceful shutdown, or an error if the server fails to start
+    pub fn serve<H: RequestHandler + 'static>(&self, db: &Connection, handler: H) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.initialized {
+            return Err("Server not initialized. Call Server::bind() first.".into());
+        }
+
+        println!("BRICK server listening on: {}", self.socket_path);
+
+        let mut event_buffer: Vec<libc::kevent> = Vec::with_capacity(EVENT_CAPACITY);
+        unsafe { event_buffer.set_len(EVENT_CAPACITY) };
+        let mut client_streams: HashMap<i32, UnixStream> = HashMap::new();
+        let mut client_states: HashMap<i32, ConnectionState> = HashMap::new();
+
+        // Wrap handler in Arc for thread safety (even though we're single-threaded)
+        // This allows for future multi-threaded support
+        let handler = Arc::new(handler);
+
+        loop {
+            let event_count = unsafe {
+                libc::kevent(
+                    self.kq,
+                    std::ptr::null(),
+                    0,
+                    event_buffer.as_mut_ptr(),
+                    EVENT_CAPACITY as i32,
+                    std::ptr::null(),
+                )
+            };
+
+            if event_count < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.into());
+            }
+
+            for i in 0..event_count as usize {
+                let event = event_buffer[i];
+                let target_fd = event.ident as i32;
+
+                // Handle connection close
+                if (event.flags & libc::EV_EOF) != 0 {
+                    client_streams.remove(&target_fd);
+                    client_states.remove(&target_fd);
+                    let _ = unregister_client(self.kq, target_fd);
+                    continue;
+                }
+
+                // Handle new connection
+                if target_fd == self.listener_fd {
+                    self.accept_connections(db, &handler, &mut client_streams, &mut client_states)?;
+                }
+                // Handle client data
+                else if event.filter == libc::EVFILT_READ {
+                    self.handle_client_data(target_fd, db, &handler, &mut client_streams, &mut client_states)?;
+                }
+            }
+        }
+    }
+
+    /// Accept new connections from the listener and register them with kqueue.
+    fn accept_connections<H: RequestHandler>(
+        &self,
+        _db: &Connection,
+        _handler: &Arc<H>,
+        client_streams: &mut HashMap<i32, UnixStream>,
+        client_states: &mut HashMap<i32, ConnectionState>,
+    ) -> std::io::Result<()> {
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(true)?;
+                    let client_fd = stream.as_raw_fd();
+                    if register_kevent(self.kq, client_fd, libc::EVFILT_READ, libc::EV_ADD | libc::EV_ENABLE).is_ok() {
+                        client_streams.insert(client_fd, stream);
+                        client_states.insert(client_fd, ConnectionState::new());
+                    }
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    eprintln!("Socket accept error: {}", error);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle data from a connected client.
+    fn handle_client_data<H: RequestHandler>(
+        &self,
+        target_fd: i32,
+        db: &Connection,
+        handler: &Arc<H>,
+        client_streams: &mut HashMap<i32, UnixStream>,
+        client_states: &mut HashMap<i32, ConnectionState>,
+    ) -> std::io::Result<()> {
+        if let Some(stream) = client_streams.get_mut(&target_fd) {
+            if let Some(state) = client_states.get_mut(&target_fd) {
+                // Try to process as FastCGI
+                match process_client_input(stream, db, &**handler, state) {
+                    Ok(true) => {
+                        // Successfully processed as FastCGI
+                        // Connection remains open for next request
+                    }
+                    Ok(false) => {
+                        // No FastCGI data processed - check for HTTP fallback
+                        self.handle_fallback_http(stream, state, target_fd);
+                        // Close connection after fallback response
+                        client_streams.remove(&target_fd);
+                        client_states.remove(&target_fd);
+                        let _ = unregister_client(self.kq, target_fd);
+                    }
+                    Err(error) => {
+                        eprintln!("Error processing FastCGI client: {}", error);
+                        // Close connection on IO error
+                        client_streams.remove(&target_fd);
+                        client_states.remove(&target_fd);
+                        let _ = unregister_client(self.kq, target_fd);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle fallback HTTP request detection and response.
+    fn handle_fallback_http(
+        &self,
+        stream: &mut UnixStream,
+        state: &mut ConnectionState,
+        _target_fd: i32,
+    ) {
+        if !state.buffer.is_empty() {
+            if state.buffer.len() >= 4 && 
+               (state.buffer.starts_with(b"GET ") || 
+                state.buffer.starts_with(b"POST") || 
+                state.buffer.starts_with(b"PUT ") ||
+                state.buffer.starts_with(b"HEAD") ||
+                state.buffer.starts_with(b"OPTIONS")) {
+                let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\npong\n";
+                let _ = stream.write_all(response);
+            }
+        }
+        // Clear buffer after fallback
+        state.buffer.clear();
+    }
+}
 
 /// Represents a parsed FastCGI request
 #[derive(Debug, Default)]
@@ -73,9 +324,9 @@ pub trait RequestHandler: Send + Sync {
 pub struct PingHandler;
 
 impl RequestHandler for PingHandler {
-    fn handle(&self, _request: &FcgiRequest, _db: &Connection) -> FcgiResponse {
+    fn handle(&self, request: &FcgiRequest, _db: &Connection) -> FcgiResponse {
         FcgiResponse {
-            request_id: 0,
+            request_id: request.request_id,
             status: 0,
             body: b"pong\n".to_vec(),
         }
@@ -488,29 +739,149 @@ mod tests {
         buffer.extend_from_slice(&frame2);
         buffer.extend_from_slice(&frame3);
         
-        // Parse the frames
-        let mut state = ConnectionState::new();
-        
         // Parse first frame
         let mut offset = 0;
-        if let Some((record_type, req_id, payload, record_len)) = parse_fcgi_record(&buffer[offset..]) {
+        if let Some((record_type, req_id, _payload, record_len)) = parse_fcgi_record(&buffer[offset..]) {
             assert_eq!(record_type, FCGI_PARAMS);
             assert_eq!(req_id, 1);
             offset += record_len;
         }
         
         // Parse second frame
-        if let Some((record_type, req_id, payload, record_len)) = parse_fcgi_record(&buffer[offset..]) {
+        if let Some((record_type, req_id, _payload, record_len)) = parse_fcgi_record(&buffer[offset..]) {
             assert_eq!(record_type, FCGI_PARAMS);
             assert_eq!(req_id, 1);
             offset += record_len;
         }
         
         // Parse third frame
-        if let Some((record_type, req_id, payload, record_len)) = parse_fcgi_record(&buffer[offset..]) {
+        if let Some((record_type, req_id, payload, _record_len)) = parse_fcgi_record(&buffer[offset..]) {
             assert_eq!(record_type, FCGI_PARAMS);
             assert_eq!(req_id, 1);
             assert_eq!(payload.len(), 0); // Empty payload
         }
+    }
+
+    #[test]
+    fn test_fragmented_record_parsing() {
+        // Test parsing a record that is split across buffer boundaries
+        // First buffer has only part of the header
+        let partial_header = [1, FCGI_PARAMS, 0, 1]; // Only 4 bytes of header
+        
+        // Second buffer has the rest of the header and part of the body
+        let rest_of_record = [0, 4, 0, 0, b't', b'e', b's', b't']; // content_length=4, padding=0, body="test"
+        
+        // Combined buffer should parse correctly
+        let mut combined = partial_header.to_vec();
+        combined.extend_from_slice(&rest_of_record);
+        
+        let result = parse_fcgi_record(&combined);
+        assert!(result.is_some());
+        let (record_type, req_id, payload, total_len) = result.unwrap();
+        assert_eq!(record_type, FCGI_PARAMS);
+        assert_eq!(req_id, 1);
+        assert_eq!(payload, b"test");
+        assert_eq!(total_len, 12); // 8 header + 4 body + 0 padding
+    }
+
+    #[test]
+    fn test_begin_request_parsing() {
+        // Test parsing FCGI_BEGIN_REQUEST
+        // Format: version, type, request_id, content_length=8, padding=0, reserved=0
+        // Body: role (2 bytes BE), flags (1 byte), reserved (5 bytes)
+        let buffer = [
+            1, FCGI_BEGIN_REQUEST, 0, 1, 0, 8, 0, 0, // header
+            0, 1, 0, 0, 0, 0, 0, 0, // body: role=FCGI_RESPONDER=1
+        ];
+        let result = parse_fcgi_record(&buffer);
+        assert!(result.is_some());
+        let (record_type, req_id, payload, total_len) = result.unwrap();
+        assert_eq!(record_type, FCGI_BEGIN_REQUEST);
+        assert_eq!(req_id, 1);
+        assert_eq!(payload.len(), 8);
+        assert_eq!(total_len, 16); // 8 header + 8 body
+        
+        // Parse role from payload
+        let role = u16::from_be_bytes([payload[0], payload[1]]);
+        assert_eq!(role, FCGI_RESPONDER);
+    }
+
+    #[test]
+    fn test_padding_calculation() {
+        // Test that padding is calculated correctly (aligns to 8-byte boundary)
+        let test_cases = vec![
+            (0, 0),   // 0 bytes -> 0 padding
+            (1, 7),   // 1 byte -> 7 padding
+            (7, 1),   // 7 bytes -> 1 padding
+            (8, 0),   // 8 bytes -> 0 padding
+            (9, 7),   // 9 bytes -> 7 padding
+            (15, 1),  // 15 bytes -> 1 padding
+            (16, 0),  // 16 bytes -> 0 padding
+        ];
+        
+        for (content_len, expected_padding) in test_cases {
+            let padding = (8 - (content_len % 8)) % 8;
+            assert_eq!(padding, expected_padding, 
+                "Padding for content_len={} should be {}", content_len, expected_padding);
+        }
+    }
+
+    #[test]
+    fn test_connection_state_buffer_management() {
+        // Test that ConnectionState properly manages its buffer
+        let mut state = ConnectionState::new();
+        
+        // Initially empty
+        assert!(state.buffer.is_empty());
+        
+        // Add some data
+        state.buffer.extend_from_slice(b"test data");
+        assert_eq!(state.buffer.len(), 9);
+        
+        // Simulate consuming 4 bytes
+        state.buffer.drain(..4);
+        assert_eq!(state.buffer.len(), 5);
+        assert_eq!(&state.buffer[..], b" data");
+    }
+
+    #[test]
+    fn test_fcgi_parser_state_reset() {
+        let mut parser = FcgiParserState::default();
+        
+        // Set some state
+        parser.request_id = Some(123);
+        parser.role = FCGI_RESPONDER;
+        parser.params.insert("TEST".to_string(), "VALUE".to_string());
+        parser.stdin_data = vec![1, 2, 3];
+        
+        // Reset
+        parser.reset();
+        
+        // Check all state is cleared
+        assert_eq!(parser.request_id, None);
+        assert_eq!(parser.role, 0);
+        assert!(parser.params.is_empty());
+        assert!(parser.stdin_data.is_empty());
+        assert!(!parser.params_complete);
+    }
+
+    #[test]
+    fn test_fcgi_parser_state_to_request() {
+        let mut parser = FcgiParserState::default();
+        
+        // Set state
+        parser.request_id = Some(456);
+        parser.role = FCGI_RESPONDER;
+        parser.params.insert("METHOD".to_string(), "GET".to_string());
+        parser.stdin_data = vec![10, 20, 30];
+        
+        // Convert to request
+        let request = parser.to_request();
+        
+        // Check request has the state
+        assert_eq!(request.request_id, 456);
+        assert_eq!(request.role, FCGI_RESPONDER);
+        assert_eq!(request.params.get("METHOD"), Some(&"GET".to_string()));
+        assert_eq!(request.stdin_data, vec![10, 20, 30]);
     }
 }
