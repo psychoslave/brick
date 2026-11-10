@@ -2,11 +2,13 @@
 
 ## The BRICK Architectural Stack
 
-| **B** | Berkeley Software Distribution (BSD) or Darwin as the host operating system |
-| **R** | Rust for compiled, memory-safe backend logic |
-| **I** | In-process database (SQLite) for direct embedded persistence without network overhead |
-| **C** | Common Gateway Interface (CGI), specifically Fast Common Gateway Interface (FastCGI) record protocol |
-| **K** | Kernel queue (kqueue) for native event notifications and non-blocking socket multiplexing |
+| Component | Technology | Role |
+| :---: | :--- | :--- |
+| **B** | Base System Distribution (BSD / Darwin) | Operating system base layer providing kernel primitives and execution isolation |
+| **R** | Rust | Compiled language providing memory safety, zero-cost abstractions, and strict typing |
+| **I** | In-process Database / Islands Architecture | Embedded zero-latency data store (SQLite) server-side; targeted WebAssembly execution client-side |
+| **C** | Common Gateway Interface (FastCGI) | Standard binary multiplexing protocol between frontend web servers and backend workers |
+| **K** | Kernel Queue (kqueue) | Native event notification mechanism for non-blocking I/O multiplexing |
 
 `brick` is a zero-dependency, ultra-minimalist library for building FastCGI services with non-blocking I/O on BSD/Darwin systems. It provides a clean separation between the generic engine and domain-specific logic, enabling reuse across multiple projects.
 
@@ -108,7 +110,7 @@ Communication occurs over a Unix domain socket at `/tmp/brick.sock`:
 
 ## Prerequisites
 
-- **Operating System**: Darwin (macOS) or Berkeley Software Distribution (FreeBSD/NetBSD/OpenBSD)
+- **Operating System**: Base System Distribution family (FreeBSD, OpenBSD, NetBSD, DragonFly BSD) or Darwin (macOS)
 - **Compiler**: Rust 1.70+ (with stable toolchain)
 - **Package Manager**: Cargo (included with Rust)
 - **Dependencies**: libc (provided by the OS)
